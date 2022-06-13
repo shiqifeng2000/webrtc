@@ -18,14 +18,83 @@ use crate::track::{TrackStream, TrackStreams};
 
 use interceptor::stream_info::RTPHeaderExtension;
 use interceptor::{Attributes, Interceptor};
+use std::fmt;
+
 use std::sync::Arc;
-use tokio::sync::{mpsc, Mutex, Notify, RwLock};
+use tokio::sync::{watch, Mutex, RwLock};
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+#[repr(u8)]
+pub enum State {
+    Initial = 0,
+    Running = 1,
+    Paused = 2,
+    Closed = 3,
+}
+
+impl From<u8> for State {
+    fn from(value: u8) -> Self {
+        match value {
+            v if v == State::Initial as u8 => State::Initial,
+            v if v == State::Running as u8 => State::Running,
+            v if v == State::Paused as u8 => State::Paused,
+            v if v == State::Closed as u8 => State::Closed,
+            _ => unreachable!(
+                "Invalid serialization of {}: {}",
+                std::any::type_name::<Self>(),
+                value
+            ),
+        }
+    }
+}
+
+impl fmt::Display for State {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            State::Initial => write!(f, "Initial"),
+            State::Running => write!(f, "Running"),
+            State::Paused => write!(f, "Paused"),
+            State::Closed => write!(f, "Closed"),
+        }
+    }
+}
+
+impl State {
+    fn transition(to: Self, tx: &watch::Sender<State>) -> Result<()> {
+        let current = *tx.borrow();
+        if current == to {
+            // Already in this state
+            return Ok(());
+        }
+
+        match current {
+            Self::Initial if matches!(to, Self::Running | Self::Paused | Self::Closed) => {
+                let _ = tx.send(to);
+                return Ok(());
+            }
+            State::Running if matches!(to, Self::Paused | Self::Closed) => {
+                let _ = tx.send(to);
+                return Ok(());
+            }
+            State::Paused if matches!(to, Self::Running | Self::Closed) => {
+                let _ = tx.send(to);
+                return Ok(());
+            }
+            _ => {}
+        }
+
+        Err(Error::ErrRTPReceiverStateChangeInvalid { from: current, to })
+    }
+}
 
 pub struct RTPReceiverInternal {
     pub(crate) kind: RTPCodecType,
+
+    // State is stored within the channel
+    state_tx: watch::Sender<State>,
+    state_rx: watch::Receiver<State>,
+
     tracks: RwLock<Vec<TrackStreams>>,
-    closed_rx: Arc<Notify>,
-    received_rx: Mutex<mpsc::Receiver<()>>,
 
     transceiver_codecs: Mutex<Option<Arc<Mutex<Vec<RTCRtpCodecParameters>>>>>,
 
@@ -37,15 +106,21 @@ pub struct RTPReceiverInternal {
 impl RTPReceiverInternal {
     /// read reads incoming RTCP for this RTPReceiver
     async fn read(&self, b: &mut [u8]) -> Result<(usize, Attributes)> {
-        {
-            let mut received_rx = self.received_rx.lock().await;
-            tokio::select! {
-                _ = received_rx.recv() =>{
-                    // Drop into the below code and don't hold this lock any longer
-                }
-                _ = self.closed_rx.notified() => {
+        let mut state_watch_rx = self.state_rx.clone();
+        loop {
+            let state = *state_watch_rx.borrow();
+
+            match state {
+                // We read RTCP even when paused
+                State::Running | State::Paused => break,
+                State::Closed => {
                     return Err(Error::ErrClosedPipe);
                 }
+                State::Initial => {}
+            }
+
+            if let Err(_) = state_watch_rx.changed().await {
+                return Err(Error::ErrClosedPipe);
             }
         }
 
@@ -53,12 +128,18 @@ impl RTPReceiverInternal {
         if let Some(t) = tracks.first() {
             if let Some(rtcp_interceptor) = &t.stream.rtcp_interceptor {
                 let a = Attributes::new();
-                tokio::select! {
-                    _ = self.closed_rx.notified() => {
-                        Err(Error::ErrClosedPipe)
-                    }
-                    result = rtcp_interceptor.read(b, &a) => {
-                        Ok(result?)
+                loop {
+                    tokio::select! {
+                        _ = state_watch_rx.changed() => {
+                            let new_state = *state_watch_rx.borrow();
+
+                            if new_state == State::Closed {
+                                return Err(Error::ErrClosedPipe)
+                            }
+                        }
+                        result = rtcp_interceptor.read(b, &a) => {
+                            return Ok(result?)
+                        }
                     }
                 }
             } else {
@@ -71,15 +152,21 @@ impl RTPReceiverInternal {
 
     /// read_simulcast reads incoming RTCP for this RTPReceiver for given rid
     async fn read_simulcast(&self, b: &mut [u8], rid: &str) -> Result<(usize, Attributes)> {
-        {
-            let mut received_rx = self.received_rx.lock().await;
-            tokio::select! {
-                _ = received_rx.recv() =>{
-                    // Drop into the below code and don't hold this lock any longer
-                }
-                _ = self.closed_rx.notified() => {
+        let mut state_watch_rx = self.state_rx.clone();
+
+        loop {
+            let state = *state_watch_rx.borrow();
+
+            match state {
+                State::Running | State::Paused => break,
+                State::Closed => {
                     return Err(Error::ErrClosedPipe);
                 }
+                State::Initial => {}
+            }
+
+            if let Err(_) = state_watch_rx.changed().await {
+                return Err(Error::ErrClosedPipe);
             }
         }
 
@@ -88,12 +175,19 @@ impl RTPReceiverInternal {
             if t.track.rid() == rid {
                 if let Some(rtcp_interceptor) = &t.stream.rtcp_interceptor {
                     let a = Attributes::new();
-                    tokio::select! {
-                        _ = self.closed_rx.notified() => {
-                            return Err(Error::ErrClosedPipe);
-                        }
-                        result = rtcp_interceptor.read(b, &a) => {
-                            return Ok(result?);
+
+                    loop {
+                        tokio::select! {
+                            _ = state_watch_rx.changed() => {
+                                let new_state = *state_watch_rx.borrow();
+
+                                if new_state == State::Closed {
+                                    return Err(Error::ErrClosedPipe)
+                                }
+                            }
+                            result = rtcp_interceptor.read(b, &a) => {
+                                return Ok(result?);
+                            }
                         }
                     }
                 } else {
@@ -135,9 +229,22 @@ impl RTPReceiverInternal {
     }
 
     pub(crate) async fn read_rtp(&self, b: &mut [u8], tid: usize) -> Result<(usize, Attributes)> {
-        {
-            let mut received_rx = self.received_rx.lock().await;
-            let _ = received_rx.recv().await;
+        let mut state_watch_rx = self.state_rx.clone();
+
+        loop {
+            let state = *state_watch_rx.borrow();
+
+            match state {
+                State::Running => break,
+                State::Closed => {
+                    return Err(Error::ErrClosedPipe);
+                }
+                State::Paused | State::Initial => {}
+            }
+
+            if let Err(err) = state_watch_rx.changed().await {
+                return Err(Error::ErrClosedPipe);
+            }
         }
 
         //log::debug!("read_rtp enter tracks tid {}", tid);
@@ -165,12 +272,19 @@ impl RTPReceiverInternal {
             //    "read_rtp rtp_interceptor.read enter with tid {} ssrc {}",
             //    tid, ssrc
             //);
-            tokio::select! {
-                _ = self.closed_rx.notified() => {
-                    Err(Error::ErrClosedPipe)
-                }
-                result = rtp_interceptor.read(b, &a) => {
-                    Ok(result?)
+            loop {
+                tokio::select! {
+                    _ = state_watch_rx.changed() => {
+                        let new_state = *state_watch_rx.borrow();
+                        // What if we become paused here?
+
+                        if new_state == State::Closed {
+                            return Err(Error::ErrClosedPipe);
+                        }
+                    }
+                    result = rtp_interceptor.read(b, &a) => {
+                        return Ok(result?);
+                    }
                 }
             }
         } else {
@@ -217,6 +331,29 @@ impl RTPReceiverInternal {
 
         filtered_codecs
     }
+
+    // State
+
+    /// Get the current state and a receiver for the next state change.
+    pub(crate) fn current_state(&self) -> State {
+        *self.state_tx.borrow()
+    }
+
+    pub(crate) fn start(&self) -> Result<()> {
+        State::transition(State::Running, &self.state_tx)
+    }
+
+    pub(crate) fn pause(&self) -> Result<()> {
+        State::transition(State::Paused, &self.state_tx)
+    }
+
+    pub(crate) fn unpause(&self) -> Result<()> {
+        State::transition(State::Running, &self.state_tx)
+    }
+
+    pub(crate) fn close(&self) -> Result<()> {
+        State::transition(State::Closed, &self.state_tx)
+    }
 }
 
 /// RTPReceiver allows an application to inspect the receipt of a TrackRemote
@@ -224,8 +361,6 @@ pub struct RTCRtpReceiver {
     receive_mtu: usize,
     kind: RTPCodecType,
     transport: Arc<RTCDtlsTransport>,
-    closed_tx: Arc<Notify>,
-    received_tx: Mutex<Option<mpsc::Sender<()>>>,
 
     pub internal: Arc<RTPReceiverInternal>,
 }
@@ -246,16 +381,12 @@ impl RTCRtpReceiver {
         media_engine: Arc<MediaEngine>,
         interceptor: Arc<dyn Interceptor + Send + Sync>,
     ) -> Self {
-        let closed_tx = Arc::new(Notify::new());
-        let closed_rx = closed_tx.clone();
-        let (received_tx, received_rx) = mpsc::channel(1);
+        let (state_tx, state_rx) = watch::channel(State::Initial);
 
         RTCRtpReceiver {
             receive_mtu,
             kind,
             transport: Arc::clone(&transport),
-            closed_tx,
-            received_tx: Mutex::new(Some(received_tx)),
 
             internal: Arc::new(RTPReceiverInternal {
                 kind,
@@ -265,8 +396,8 @@ impl RTCRtpReceiver {
                 media_engine,
                 interceptor,
 
-                closed_rx,
-                received_rx: Mutex::new(received_rx),
+                state_tx,
+                state_rx,
 
                 transceiver_codecs: Mutex::new(None),
             }),
@@ -345,11 +476,10 @@ impl RTCRtpReceiver {
         let receiver = Arc::downgrade(&self.internal);
 
         let _d = {
-            let mut received_tx = self.received_tx.lock().await;
-            if received_tx.is_none() {
+            if self.internal.current_state() != State::Initial {
                 return Err(Error::ErrRTPReceiverReceiveAlreadyCalled);
             }
-            received_tx.take()
+            self.internal.start()?;
         };
 
         let (global_params, interceptor, media_engine) = {
@@ -485,8 +615,7 @@ impl RTCRtpReceiver {
     }
 
     pub(crate) async fn have_received(&self) -> bool {
-        let received_tx = self.received_tx.lock().await;
-        received_tx.is_none()
+        self.internal.current_state() != State::Initial
     }
 
     pub(crate) async fn start(&self, incoming: &TrackDetails) {
@@ -522,15 +651,11 @@ impl RTCRtpReceiver {
 
     /// Stop irreversibly stops the RTPReceiver
     pub async fn stop(&self) -> Result<()> {
-        self.closed_tx.notify_waiters();
-
-        let received_tx_is_none = {
-            let received_tx = self.received_tx.lock().await;
-            received_tx.is_none()
-        };
+        let previous_state = self.internal.current_state();
+        self.internal.close()?;
 
         let mut errs = vec![];
-        if received_tx_is_none {
+        if previous_state != State::Initial {
             let tracks = self.internal.tracks.write().await;
             for t in &*tracks {
                 if let Some(rtcp_read_stream) = &t.stream.rtcp_read_stream {
